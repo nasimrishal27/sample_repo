@@ -1,0 +1,667 @@
+rental_lease.py
+
+from odoo import _, api, fields, models
+from odoo.exceptions import ValidationError
+
+class RentalLease(models.Model):
+    """ model for storing rental/lease details """
+    _name = "rental.lease"
+    _description = "Rental or Lease Management"
+    _inherit = 'mail.thread', 'mail.activity.mixin'
+
+    # _rec_names_search = ['order_line.property_id']
+
+    # @property
+    # def _rec_names_search(self):
+    #     if self._context.get('sale_show_partner_name'):
+    #         return ['name', 'partner_id.name']
+    #     return ['name']
+
+    name = fields.Char(string="Sequence", copy=False, default=lambda self: _('New'),
+                       readonly=True, store=True)
+    tenant_id = fields.Many2one(comodel_name="res.partner", string="Tenant",
+                                required=True)
+    currency_id = fields.Many2one('res.currency', string="Currency",
+                                  default=lambda self: self.env.user.company_id.currency_id.id)
+    date_start = fields.Date(string='Start Date', required=True)
+    date_end = fields.Date(string='Expiration Date', index=True, tracking=True, required=True)
+    total_days = fields.Integer(string="Total Days", compute='_compute_days', readonly=True,
+                                store=True)
+    state = fields.Selection([("draft", "Draft"), ("confirm", "Confirmed"), ("close", "Closed"),
+                              ("return", "Return"), ("expired", "Expired")], string="state",
+                             default="draft", tracking=True)
+    total_amount = fields.Monetary(string="Total Amount", store=True, compute="_compute_total")
+    company_id = fields.Many2one(comodel_name="res.company", string="Company", required=True,
+                                 default=lambda self: self.env.user.company_id.id)
+    property_type = fields.Selection([("rent", "Rent"), ("lease", "Lease")], string="Type",
+                                     required=True, default="rent")
+    invoice_id = fields.Many2one("account.move", string="Invoice", readonly=True)
+    invoice_count = fields.Integer(string="Invoice", compute='_compute_invoice_count', default=0)
+    invoice_state = fields.Selection([("draft", "Draft"), ("posted", "Posted"),
+                                      ("cancelled", "Cancelled")], string="state", default='draft')
+    # Lines and line based computes
+    order_line = fields.One2many(
+        comodel_name='rental.lease.order.line',
+        inverse_name='order_id',
+        string="Order Lines",
+        copy=True, auto_join=True,
+        ondelete='cascade')
+    payment_state = fields.Selection(
+        selection=[('draft', 'Draft'), ('not_paid', 'Not Paid'), ('paid', 'Paid')],
+        string="Payment Status", store=True, readonly=True, compute="_compute_payment_state",
+        copy=False,
+        tracking=True, default='draft'
+    )
+    # invoice_ids = fields.Many2many(
+    #     comodel_name='account.move',
+    #     string="Invoices",
+    #     compute='_get_invoiced',
+    #     search='_search_invoice_ids',
+    #     copy=False)
+    # locked = fields.Boolean(
+    #     help="Locked orders cannot be modified.",
+    #     default=False,
+    #     copy=False,
+    #     tracking=True)
+    # client_order_ref = fields.Char(string="Customer Reference", copy=False)
+    origin = fields.Char(
+        string="Source Document",
+        help="Reference of the document that generated this sales order request")
+    # reference = fields.Char(
+    #     string="Payment Ref.",
+    #     help="The payment communication of this sale order.",
+    #     copy=False)
+    # journal_id = fields.Many2one(
+    #     'account.journal', string="Invoicing Journal",
+    #     compute="_compute_journal_id", store=True, readonly=False, precompute=True,
+    #     domain=[('type', '=', 'sale')], check_company=True,
+    #     help="If set, the SO will invoice in this journal; "
+    #          "otherwise the sales journal with the lowest sequence is used.")
+    # amount_to_invoice = fields.Monetary(string="Un-invoiced Balance", compute='_compute_amount_to_invoice')
+    # amount_invoiced = fields.Monetary(string="Already invoiced", compute='_compute_amount_invoiced')
+    # invoice_count = fields.Integer(string="Invoice Count", compute='_get_invoiced')
+    # invoice_status = fields.Selection(
+    #     selection=INVOICE_STATUS,
+    #     string="Invoice Status",
+    #     compute='_compute_invoice_status',
+    #     store=True)
+    # transaction_ids = fields.Many2many(
+    #     comodel_name='payment.transaction',
+    #     relation='rental_lease_order_transaction_rel', column1='rental_lease_order_id', column2='transaction_id',
+    #     string="Transactions",
+    #     copy=False, readonly=True)
+    # authorized_transaction_ids = fields.Many2many(
+    #     comodel_name='payment.transaction',
+    #     string="Authorized Transactions",
+    #     compute='_compute_authorized_transaction_ids',
+    #     copy=False,
+    #     compute_sudo=True)
+    # amount_paid = fields.Float(
+    #     string="Payment Transactions Amount",
+    #     help="Sum of transactions made in through the online payment form that are in the state"
+    #          " 'done' or 'authorized' and linked to this order.",
+    #     compute='_compute_amount_paid',
+    #     compute_sudo=True,
+    # )
+    #
+    # @api.depends('order_line.invoice_lines')
+    # def _get_invoiced(self):
+    #     # The invoice_ids are obtained thanks to the invoice lines of the SO
+    #     # lines, and we also search for possible refunds created directly from
+    #     # existing invoices. This is necessary since such a refund is not
+    #     # directly linked to the SO.
+    #     for order in self:
+    #         invoices = order.order_line.invoice_lines.move_id.filtered(
+    #             lambda r: r.move_type in ('out_invoice', 'out_refund'))
+    #         order.invoice_ids = invoices
+    #         order.invoice_count = len(invoices)
+    # #
+    # def _search_invoice_ids(self, operator, value):
+    #     if operator == 'in' and value:
+    #         self.env.cr.execute("""
+    #             SELECT array_agg(so.id)
+    #                 FROM sale_order so
+    #                 JOIN sale_order_line sol ON sol.order_id = so.id
+    #                 JOIN sale_order_line_invoice_rel soli_rel ON soli_rel.order_line_id = sol.id
+    #                 JOIN account_move_line aml ON aml.id = soli_rel.invoice_line_id
+    #                 JOIN account_move am ON am.id = aml.move_id
+    #             WHERE
+    #                 am.move_type in ('out_invoice', 'out_refund') AND
+    #                 am.id = ANY(%s)
+    #         """, (list(value),))
+    #         so_ids = self.env.cr.fetchone()[0] or []
+    #         return [('id', 'in', so_ids)]
+    #     elif operator == '=' and not value:
+    #         # special case for [('invoice_ids', '=', False)], i.e. "Invoices is not set"
+    #         #
+    #         # We cannot just search [('order_line.invoice_lines', '=', False)]
+    #         # because it returns orders with uninvoiced lines, which is not
+    #         # same "Invoices is not set" (some lines may have invoices and some
+    #         # doesn't)
+    #         #
+    #         # A solution is making inverted search first ("orders with invoiced
+    #         # lines") and then invert results ("get all other orders")
+    #         #
+    #         # Domain below returns subset of ('order_line.invoice_lines', '!=', False)
+    #         order_ids = self._search([
+    #             ('order_line.invoice_lines.move_id.move_type', 'in', ('out_invoice', 'out_refund'))
+    #         ])
+    #         return [('id', 'not in', order_ids)]
+    #     return [
+    #         ('order_line.invoice_lines.move_id.move_type', 'in', ('out_invoice', 'out_refund')),
+    #         ('order_line.invoice_lines.move_id', operator, value),
+    #     ]
+
+    @api.depends('invoice_id')
+    def _compute_invoice_count(self):
+        """ Invoice Count """
+        for record in self:
+            record.invoice_count = self.env['account.move'].search_count(
+                [("partner_id", "=", self.tenant_id.id),
+                 ("move_type", "=", "out_invoice"),
+                 ("invoice_origin", "=", self.name)])
+        # rec = self.env['account.move'].search(
+        #     [("partner_id", "=", self.tenant_id.id),
+        #      ("move_type", "=", "out_invoice"),
+        #      ("invoice_origin", "=", self.name)])
+        # if rec.status_in_payment == 'draft':
+        #     self.payment_state = 'draft'
+        # elif rec.status_in_payment == 'not_paid':
+        #     self.payment_state = 'not_paid'
+        #     body = _("Invoice is Posted for %s", self.name)
+        #     self.message_post(body=body)
+        # elif rec.status_in_payment == 'paid':
+        #     self.payment_state = 'paid'
+
+    @api.depends('date_end', 'date_start')
+    def _compute_days(self):
+        """ Calculate total no of days """
+        if self.date_end:
+            d1 = self.date_start
+            d2 = self.date_end
+            self.total_days = (d2 - d1).days
+
+    @api.depends('order_line.property_id', 'property_type')
+    def _compute_total(self):
+        """ Total Amount """
+        for order in self:
+            total = 0.0
+            for line in order.order_line:
+                total += line.price_subtotal
+            order.total_amount = total
+
+    @api.model
+    def create(self, vals):
+        """ Create a sequence for the model """
+        if vals.get('name', _('New')) == _('New'):
+            vals['name'] = self.env['ir.sequence'].next_by_code('rental.lease')
+        return super().create(vals)
+
+    def create_invoice(self):
+        """ Methode to create invoice """
+        self.ensure_one()
+        invoice_obj = self.env["account.move"]
+        invoice_line_obj = self.env["account.move.line"]
+
+        # Find an existing draft invoice for the tenant
+        draft_invoice = invoice_obj.search([
+            ("partner_id", "=", self.tenant_id.id),
+            ("state", "=", "draft"),
+            ("move_type", "=", "out_invoice"),
+            ("invoice_origin", "=", self.name)
+        ], limit=1)
+
+        if draft_invoice:
+            for line in self.order_line:
+                existing_line = draft_invoice.invoice_line_ids.filtered(
+                    lambda l: l.name == f"Rent for {line.property_id.name}"
+                )
+                if existing_line:
+                    invoice_line_obj.create({
+                        "quantity": line.qty_to_invoice,
+                    })
+                elif not existing_line:
+                    invoice_line_obj.create({
+                        "move_id": draft_invoice.id,
+                        "name": f"Rent for {line.property_id.name}",
+                        "quantity": line.qty_to_invoice,
+                        "price_unit": line.price_unit,
+                    })
+            self.invoice_id = draft_invoice.id
+            invoice_id = draft_invoice.id
+        else:
+            invoice_lines = []
+            for line in self.order_line:
+                invoice_lines.append((0, 0, {
+                    "name": f"Rent for {line.property_id.name}",
+                    "quantity": line.qty_to_invoice,
+                    "price_unit": line.price_unit,
+                }))
+
+            new_invoice = invoice_obj.create({
+                "partner_id": self.tenant_id.id,
+                "move_type": "out_invoice",
+                "invoice_origin": self.name,
+                "invoice_line_ids": invoice_lines,
+            })
+            self.invoice_id = new_invoice.id
+            invoice_id = new_invoice.id
+        return {
+            "name": "Customer Invoice",
+            "type": "ir.actions.act_window",
+            "res_model": "account.move",
+            "view_mode": "form",
+            "res_id": invoice_id,
+            "target": "current",
+        }
+
+    def action_draft(self):
+        """ draft button """
+        self.write({'state': "draft"})
+        for rec in self:
+            for line in rec.order_line:
+                line.property_id.state = 'draft'
+
+    def action_confirm(self):
+        """ confirm button """
+        if self.message_attachment_count < 1:
+            raise ValidationError("Please Attachment The Supporting File")
+        self.write({'state': "confirm"})
+        for rec in self:
+            for line in rec.order_line:
+                if self.property_type == 'rent':
+                    line.property_id.state = 'rented'
+                elif self.property_type == 'lease':
+                    line.property_id.state = 'leased'
+
+    def action_close(self):
+        """ close button """
+        self.write({'state': "close"})
+        for rec in self:
+            for line in rec.order_line:
+                line.property_id.state = 'draft'
+
+    def action_return(self):
+        """ return button """
+        self.write({'state': "return"})
+        for rec in self:
+            for line in rec.order_line:
+                line.property_id.state = 'draft'
+
+    def action_expired(self):
+        """ expire button """
+        self.write({'state': "expired"})
+
+    def action_open_rental_lease_invoice(self, invoices=False):
+        """ Smart Button Action """
+        # if not invoices:
+        #     invoices = self.mapped('invoice_ids')
+        # action = self.env['ir.actions.actions']._for_xml_id('account.action_move_out_invoice_type')
+        # if len(invoices) > 1:
+        #     action['domain'] = [('id', 'in', invoices.ids)]
+        # elif len(invoices) == 1:
+        #     form_view = [(self.env.ref('account.view_move_form').id, 'form')]
+        #     if 'views' in action:
+        #         action['views'] = form_view + [(state, view) for state, view in action['views'] if view != 'form']
+        #     else:
+        #         action['views'] = form_view
+        #     action['res_id'] = invoices.id
+        # else:
+        #     action = {'type': 'ir.actions.act_window_close'}
+        #
+        # context = {
+        #     'default_move_type': 'out_invoice',
+        # }
+        # if len(self) == 1:
+        #     context.update({
+        #         'default_partner_id': self.tenant_id.id,
+        #         'default_invoice_origin': self.name,
+        #     })
+        # action['context'] = context
+        # print(invoices)
+        # return action
+        self.ensure_one()
+        return {
+            'type': 'ir.actions.act_window',
+            'name': 'Invoice',
+            'view_mode': 'list, form',
+            'views': [(False, 'list'), (False, 'form')],
+            'res_model': 'account.move',
+            'domain': [('partner_id', '=', self.tenant_id.id),
+                       ("move_type", "=", "out_invoice"),
+                       ("invoice_origin", "=", self.name)],
+            'context': "{'create': False}",
+            'target': "current",
+        }
+
+    # neww
+    # def _compute_journal_id(self):
+    #     self.journal_id = False
+    #
+    # @api.depends('order_line.amount_to_invoice')
+    # def _compute_amount_to_invoice(self):
+    #     for order in self:
+    #         order.amount_to_invoice = sum(order.order_line.mapped('amount_to_invoice'))
+    #
+    # @api.depends('order_line.amount_invoiced')
+    # def _compute_amount_invoiced(self):
+    #     for order in self:
+    #         order.amount_invoiced = sum(order.order_line.mapped('amount_invoiced'))
+    #
+    # @api.depends('state', 'order_line.invoice_status')
+    # def _compute_invoice_status(self):
+    #     """
+    #     Compute the invoice status of a SO. Possible statuses:
+    #     - no: if the SO is not in status 'sale' or 'done', we consider that there is nothing to
+    #       invoice. This is also the default value if the conditions of no other status is met.
+    #     - to invoice: if any SO line is 'to invoice', the whole SO is 'to invoice'
+    #     - invoiced: if all SO lines are invoiced, the SO is invoiced.
+    #     - upselling: if all SO lines are invoiced or upselling, the status is upselling.
+    #     """
+    #     confirmed_orders = self.filtered(lambda so: so.state == 'sale')
+    #     (self - confirmed_orders).invoice_status = 'no'
+    #     if not confirmed_orders:
+    #         return
+    #     lines_domain = [('is_downpayment', '=', False), ('display_type', '=', False)]
+    #     line_invoice_status_all = [
+    #         (order.id, invoice_status)
+    #         for order, invoice_status in self.env['sale.order.line']._read_group(
+    #             lines_domain + [('order_id', 'in', confirmed_orders.ids)],
+    #             ['order_id', 'invoice_status']
+    #         )
+    #     ]
+    #     for order in confirmed_orders:
+    #         line_invoice_status = [d[1] for d in line_invoice_status_all if d[0] == order.id]
+    #         if order.state != 'sainvoice_idsle':
+    #             order.invoice_status = 'no'
+    #         elif any(invoice_status == 'to invoice' for invoice_status in line_invoice_status):
+    #             if any(invoice_status == 'no' for invoice_status in line_invoice_status):
+    #                 # If only discount/delivery/promotion lines can be invoiced, the SO should not
+    #                 # be invoiceable.
+    #                 invoiceable_domain = lines_domain + [('invoice_status', '=', 'to invoice')]
+    #                 invoiceable_lines = order.order_line.filtered_domain(invoiceable_domain)
+    #                 special_lines = invoiceable_lines.filtered(
+    #                     lambda sol: not sol._can_be_invoiced_alone()
+    #                 )
+    #                 if invoiceable_lines == special_lines:
+    #                     order.invoice_status = 'no'
+    #                 else:
+    #                     order.invoice_status = 'to invoice'
+    #             else:
+    #                 order.invoice_status = 'to invoice'
+    #         elif line_invoice_status and all(invoice_status == 'invoiced' for invoice_status in line_invoice_status):
+    #             order.invoice_status = 'invoiced'
+    #         elif line_invoice_status and all(
+    #                 invoice_status in ('invoiced', 'upselling') for invoice_status in line_invoice_status):
+    #             order.invoice_status = 'upselling'
+    #         else:
+    #             order.invoice_status = 'no'
+    #
+    # @api.depends('transaction_ids')
+    # def _compute_amount_paid(self):
+    #     """ Sum of the amount paid through all transactions for this SO. """
+    #     for order in self:
+    #         order.amount_paid = sum(
+    #             tx.amount for tx in order.transaction_ids if tx.state in ('authorized', 'done')
+    #         )
+    #
+    # @api.depends('transaction_ids')
+    # def _compute_authorized_transaction_ids(self):
+    #     for trans in self:
+    #         trans.authorized_transaction_ids = trans.transaction_ids.filtered(lambda t: t.state == 'authorized')
+
+rental_lease_order_line.py
+
+# -*- coding: utf-8 -*-
+from email.policy import default
+
+from reportlab.graphics.transform import inverse
+
+from odoo import api, fields, models
+
+
+class RentalLeaseOrderLine(models.Model):
+    _name = "rental.lease.order.line"
+    _inherit = 'analytic.mixin'
+    _description = "Rental Lease Order Line"
+    _rec_names_search = ['name', 'order_id.name']
+
+    order_id = fields.Many2one(
+        comodel_name='rental.lease',
+        string="Order Reference",
+        required=True, ondelete='cascade', copy=False)
+    # Order-related fields
+    company_id = fields.Many2one(
+        related='order_id.company_id',
+        store=True, index=True, precompute=True)
+    currency_id = fields.Many2one(
+        related='order_id.currency_id',
+        depends=['order_id.currency_id'],
+        store=True, precompute=True)
+    property_id = fields.Many2one(
+        comodel_name='property.property',
+        string="Property",
+        change_default=True, ondelete='cascade', index='btree_not_null',
+        domain=[('state', '=', 'draft')])
+    price_unit = fields.Monetary(string="Property Price", store=True, compute="_compute_amount")
+    technical_price_unit = fields.Float()
+    price_subtotal = fields.Monetary(
+        string="Subtotal",
+        store=True, compute='_compute_subtotal')
+    price_total = fields.Monetary(
+        string="Total",
+        store=True, compute="_compute_total")
+    invoice_lines = fields.Many2many(
+        comodel_name='account.move.line',
+        relation='rental_lease_order_line_invoice_rel', column1='order_line_id', column2='invoice_line_id',
+        string="Invoice Lines",
+        copy=False)
+    order_partner_id = fields.Many2one(
+        related='order_id.tenant_id',
+        string="Customer",
+        store=True, index=True, precompute=True)
+    state = fields.Selection(
+        related='order_id.state',
+        string="Order Status",
+        copy=False, store=True, precompute=True)
+    # name = fields.Text(
+    #     string="Description",
+    #     compute='_compute_name',
+    #     store=True, readonly=False, required=True, precompute=True)
+    qty_invoiced = fields.Float(
+        string="Invoiced Quantity",
+        compute='_compute_qty_invoiced',
+        digits='Product Unit of Measure',
+        store=True)
+    qty_invoiced_posted = fields.Float(
+        string="Invoiced Quantity (posted)",
+        compute='_compute_qty_invoiced_posted',
+        digits='Product Unit of Measure')
+    quantity = fields.Float(
+        string="Quantity",
+        compute='_compute_qty_to_invoice',
+        digits='Product Unit of Measure',
+        store=True)
+    qty_to_invoice = fields.Float(
+        string="Quantity to Invoice",
+        # compute='_compute_qty_to_invoice',
+        digits='Product Unit of Measure',
+        store=True)
+
+    @api.depends('order_id.invoice_id')
+    def _compute_qty_invoiced(self):
+        """ Computing quantity to invoice """
+        # record = self.env['account.move'].search(
+        #     [("partner_id", "=", self.order_id.tenant_id.id),
+        #      ("state", "!=", "cancel"),
+        #      ("move_type", "=", "out_invoice"),
+        #      ("invoice_origin", "=", self.order_id.name)])
+        # for rec in record:
+        #     print(rec.invoice_line_ids)
+        #     for order in rec.invoice_line_ids:
+        #         print(order.rental_lease_line_ids)
+        #         for line in order:
+        #             print(line.rental_lease_line_ids)
+        #             # if line.name == f"Rent for {self.property_id.name}":
+        #             #     print(self.property_id.name)
+
+    @api.depends('invoice_lines.move_id.state', 'invoice_lines.quantity')
+    def _compute_qty_invoiced_posted(self):
+        """
+        This method is almost identical to '_compute_qty_invoiced()'. The only difference lies in the fact that
+        for accounting purposes, we only want the quantities of the posted invoices.
+        We need a dedicated computation because the triggers are different and could lead to incorrect values for
+        'qty_invoiced' when computed together.
+        """
+        # for line in self:
+        #     qty_invoiced_posted = 0.0
+        #     for invoice_line in line._get_invoice_lines():
+        #         if invoice_line.move_id.state == 'posted' or invoice_line.move_id.payment_state == 'invoicing_legacy':
+        #             qty_unsigned = invoice_line.product_uom_id._compute_quantity(invoice_line.quantity,
+        #                                                                          line.product_uom)
+        #             qty_signed = qty_unsigned * -invoice_line.move_id.direction_sign
+        #             qty_invoiced_posted += qty_signed
+        #     line.qty_invoiced_posted = qty_invoiced_posted
+
+    # def _get_invoice_lines(self):
+    #     self.ensure_one()
+    #     return self.invoice_lines.filtered(
+    #         lambda l: l.move_id.invoice_date and l.move_id.invoice_date <= self._context['accrual_entry_date']
+    #     )
+
+    @api.depends('qty_invoiced', 'order_id.invoice_id')
+    def _compute_qty_to_invoice(self):
+        """
+        Compute the quantity to invoice. If the invoice policy is order, the quantity to invoice is
+        calculated from the ordered quantity. Otherwise, the quantity delivered is used.
+        """
+        for line in self:
+            if line.state != 'draft':
+                line.qty_to_invoice = line.quantity - line.qty_invoiced
+            else:
+                line.qty_to_invoice = 0
+
+    @api.depends('order_id.property_type', 'property_id')
+    def _compute_amount(self):
+        """ Computing amount """
+        for rec in self:
+            rec.quantity = rec.order_id.total_days
+            rec.qty_to_invoice = rec.order_id.total_days
+            if rec.order_id.property_type == 'rent':
+                rec.price_unit = rec.property_id.rent_amount
+            else:
+                rec.price_unit = rec.property_id.lease_amount
+
+    @api.depends('price_unit', 'order_id.total_days')
+    def _compute_subtotal(self):
+        for rec in self:
+            rec.price_subtotal = rec.price_unit * rec.order_id.total_days
+            if rec.order_id.property_type == 'rent':
+                rec.property_id.rent_amount = rec.price_unit
+            else:
+                rec.property_id.lease_amount = rec.price_unit
+
+    @api.depends('order_id.property_type', 'property_id')
+    def _compute_total(self):
+        for line in self:
+            line.price_total += line.price_subtotal
+
+
+account.move.py
+# -*- coding: utf-8 -*-
+from odoo import fields, models
+
+class AccountMove(models.Model):
+    _name = 'account.move'
+    _inherit = ['account.move', 'utm.mixin']
+
+
+account.move.line.py
+from odoo import api, fields, models
+
+
+class AccountMoveLine(models.Model):
+    _inherit = 'account.move.line'
+
+    rental_lease_line_ids = fields.Many2many(
+        'rental.lease.order.line',
+        'rental_lease_order_line_invoice_rel',
+        'invoice_line_id', 'order_line_id',
+        string='Rental/lease Order Lines', readonly=True, copy=False)
+
+
+here is my files and i want to link the rental order line to the invoice lines of different invoice of the same rental order to calculate the total invoiced quantity becouse i anable the feature to edit the quantity in the draft invoice and i want to fetch the remaining quantity while creating next invoice
+
+
+def create_invoice(self):
+    """ Method to create invoice """
+    self.ensure_one()
+    invoice_obj = self.env["account.move"]
+    invoice_line_obj = self.env["account.move.line"]
+
+    # Find an existing draft invoice for the tenant
+    draft_invoice = invoice_obj.search([
+        ("partner_id", "=", self.tenant_id.id),
+        ("state", "=", "draft"),
+        ("move_type", "=", "out_invoice"),
+        ("invoice_origin", "=", self.name)
+    ], limit=1)
+
+    if draft_invoice:
+        for line in self.order_line:
+            existing_line = draft_invoice.invoice_line_ids.filtered(
+                lambda l: l.name == f"Rent for {line.property_id.name}"
+            )
+            if existing_line:
+                new_invoice_line = invoice_line_obj.create({
+                    "move_id": draft_invoice.id,
+                    "name": f"Rent for {line.property_id.name}",
+                    "quantity": line.qty_to_invoice,
+                    "price_unit": line.price_unit,
+                })
+                new_invoice_line.rental_lease_line_ids = [(4, line.id)]  # Link rental order line to invoice line
+            else:
+                new_invoice_line = invoice_line_obj.create({
+                    "move_id": draft_invoice.id,
+                    "name": f"Rent for {line.property_id.name}",
+                    "quantity": line.qty_to_invoice,
+                    "price_unit": line.price_unit,
+                })
+                new_invoice_line.rental_lease_line_ids = [(4, line.id)]  # Link rental order line to invoice line
+
+        self.invoice_id = draft_invoice.id
+        invoice_id = draft_invoice.id
+    else:
+        invoice_lines = []
+        for line in self.order_line:
+            invoice_line_vals = {
+                "name": f"Rent for {line.property_id.name}",
+                "quantity": line.qty_to_invoice,
+                "price_unit": line.price_unit,
+            }
+            new_invoice_line = invoice_line_obj.create(invoice_line_vals)
+            new_invoice_line.rental_lease_line_ids = [(4, line.id)]  # Link rental order line to invoice line
+            invoice_lines.append((0, 0, invoice_line_vals))
+
+        new_invoice = invoice_obj.create({
+            "partner_id": self.tenant_id.id,
+            "move_type": "out_invoice",
+            "invoice_origin": self.name,
+            "invoice_line_ids": invoice_lines,
+        })
+        self.invoice_id = new_invoice.id
+        invoice_id = new_invoice.id
+
+    return {
+        "name": "Customer Invoice",
+        "type": "ir.actions.act_window",
+        "res_model": "account.move",
+        "view_mode": "form",
+        "res_id": invoice_id,
+        "target": "current",
+    }
+
+def _compute_price_total(self):
+    """function to calculate total amount"""
+    for range in self:
+        range.price_total = sum(range.orderline_ids.mapped('price_subtotal'))
